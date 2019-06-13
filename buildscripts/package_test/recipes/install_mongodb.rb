@@ -11,12 +11,9 @@ ruby_block 'allow sudo over tty' do
   end
 end
 
-# These files limits processes. They therefore interferere with `ulimit -u` when present.
+# This file limits processes to 1024. It therefore interfereres with `ulimit -u` when present.
 if platform_family? 'rhel'
   file '/etc/security/limits.d/90-nproc.conf' do
-    action :delete
-  end
-  file '/etc/security/limits.d/20-nproc.conf' do
     action :delete
   end
 end
@@ -110,6 +107,7 @@ end
 
 inspec_wait = <<HEREDOC
 #!/bin/bash
+ulimit -v unlimited
 for i in {1..60}
 do
   mongo --eval "db.smoke.insert({answer: 42})"

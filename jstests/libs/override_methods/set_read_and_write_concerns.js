@@ -12,9 +12,7 @@
             " property on the global TestData object");
     }
 
-    const kDefaultReadConcern = {
-        level: TestData.defaultReadConcernLevel
-    };
+    const kDefaultReadConcern = {level: TestData.defaultReadConcernLevel};
     const kDefaultWriteConcern =
         (TestData.hasOwnProperty("defaultWriteConcern")) ? TestData.defaultWriteConcern : {
             w: "majority",
@@ -35,52 +33,66 @@
     ]);
 
     const kCommandsSupportingWriteConcern = new Set([
+        "_configsvrAddShard",
+        "_configsvrAddShardToZone",
+        "_configsvrCommitChunkMerge",
+        "_configsvrCommitChunkMigration",
+        "_configsvrCommitChunkSplit",
+        "_configsvrCreateDatabase",
+        "_configsvrEnableSharding",
+        "_configsvrMoveChunk",
+        "_configsvrMovePrimary",
+        "_configsvrRemoveShard",
+        "_configsvrRemoveShardFromZone",
+        "_configsvrShardCollection",
+        "_configsvrUpdateZoneKeyRange",
+        "_mergeAuthzCollections",
+        "_recvChunkStart",
+        "appendOplogNote",
         "applyOps",
         "authSchemaUpgrade",
-        "createRole",
-        "createUser",
-        "delete",
-        "dropAllRolesFromDatabase",
-        "dropAllUsersFromDatabase",
-        "dropRole",
-        "dropUser",
-        "findAndModify",
-        "findandmodify",
-        "grantPrivilegesToRole",
-        "grantRolesToRole",
-        "grantRolesToUser",
-        "insert",
-        "revokeRolesFromRole",
-        "revokeRolesFromUser",
-        "update",
-        "updateRole",
-        "updateUser",
-    ]);
-
-    const kCommandsToEmulateWriteConcern = new Set([
         "aggregate",
-        "appendOplogNote",
         "captrunc",
         "cleanupOrphaned",
         "clone",
         "cloneCollection",
         "cloneCollectionAsCapped",
+        // "collMod", SERVER-25196 - not supported
         "convertToCapped",
         "copydb",
         "create",
         "createIndexes",
+        "createRole",
+        "createUser",
+        "delete",
         "deleteIndexes",
         "drop",
+        "dropAllRolesFromDatabase",
+        "dropAllUsersFromDatabase",
         "dropDatabase",
         "dropIndexes",
+        "dropRole",
+        "dropUser",
         "emptycapped",
+        "findAndModify",
+        "findandmodify",
         "godinsert",
+        "grantPrivilegesToRole",
+        "grantRolesToRole",
+        "grantRolesToUser",
+        "insert",
         "mapReduce",
         "mapreduce",
         "mapreduce.shardedfinish",
         "moveChunk",
         "renameCollection",
         "revokePrivilegesFromRole",
+        "revokeRolesFromRole",
+        "revokeRolesFromUser",
+        "setFeatureCompatibilityVersion",
+        "update",
+        "updateRole",
+        "updateUser",
     ]);
 
     function runCommandWithReadAndWriteConcerns(
@@ -91,7 +103,7 @@
 
         // If the command is in a wrapped form, then we look for the actual command object inside
         // the query/$query object.
-        var commandObjUnwrapped = commandObj;
+        let commandObjUnwrapped = commandObj;
         if (commandName === "query" || commandName === "$query") {
             commandObjUnwrapped = commandObj[commandName];
             commandName = Object.keys(commandObjUnwrapped)[0];
@@ -103,17 +115,16 @@
                             tojson(commandObj));
         }
 
-        var shouldForceReadConcern = kCommandsSupportingReadConcern.has(commandName);
-        var shouldForceWriteConcern = kCommandsSupportingWriteConcern.has(commandName);
-        var shouldEmulateWriteConcern = kCommandsToEmulateWriteConcern.has(commandName);
+        let shouldForceReadConcern = kCommandsSupportingReadConcern.has(commandName);
+        let shouldForceWriteConcern = kCommandsSupportingWriteConcern.has(commandName);
 
         if (commandName === "aggregate") {
             if (OverrideHelpers.isAggregationWithOutStage(commandName, commandObjUnwrapped)) {
                 // The $out stage can only be used with readConcern={level: "local"}.
                 shouldForceReadConcern = false;
             } else {
-                // Only a $out aggregation does writes.
-                shouldEmulateWriteConcern = false;
+                // A writeConcern can only be used with a $out stage.
+                shouldForceWriteConcern = false;
             }
 
             if (commandObjUnwrapped.explain) {
@@ -147,7 +158,7 @@
             }
 
             if (commandObjUnwrapped.hasOwnProperty("readConcern")) {
-                var readConcern = commandObjUnwrapped.readConcern;
+                let readConcern = commandObjUnwrapped.readConcern;
 
                 if (typeof readConcern !== "object" || readConcern === null ||
                     (readConcern.hasOwnProperty("level") &&
@@ -177,7 +188,7 @@
             }
 
             if (commandObjUnwrapped.hasOwnProperty("writeConcern")) {
-                var writeConcern = commandObjUnwrapped.writeConcern;
+                let writeConcern = commandObjUnwrapped.writeConcern;
 
                 if (typeof writeConcern !== "object" || writeConcern === null ||
                     (writeConcern.hasOwnProperty("w") &&
@@ -195,17 +206,7 @@
             }
         }
 
-        const serverResponse = func.apply(conn, makeFuncArgs(commandObj));
-
-        if (shouldEmulateWriteConcern && serverResponse.ok === 1) {
-            // We only wait for the write concern if the command succeeded to match what the
-            // server's behavior would have been if the command supports the "writeConcern" option
-            // itself.
-            assert.commandWorked(
-                conn.runCommand(dbName, Object.assign({getLastError: 1}, kDefaultWriteConcern), 0));
-        }
-
-        return serverResponse;
+        return func.apply(conn, makeFuncArgs(commandObj));
     }
 
     OverrideHelpers.prependOverrideInParallelShell(

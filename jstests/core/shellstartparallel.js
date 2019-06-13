@@ -1,4 +1,3 @@
-// @tags: [requires_parallel_shell]
 function f() {
     throw Error("intentional_throw_to_test_assert_throws");
 }

@@ -45,23 +45,17 @@ void QueryPlannerCommon::reverseScans(QuerySolutionNode* node) {
 
         if (isn->bounds.isSimpleRange) {
             std::swap(isn->bounds.startKey, isn->bounds.endKey);
-            // XXX: Not having a startKeyInclusive means that if we reverse a max/min query
-            // we have different results with and without the reverse...
-            isn->bounds.endKeyInclusive = true;
+            // If only one bound is included, swap which one is included.
+            isn->bounds.boundInclusion =
+                IndexBounds::reverseBoundInclusion(isn->bounds.boundInclusion);
         } else {
             for (size_t i = 0; i < isn->bounds.fields.size(); ++i) {
-                std::vector<Interval>& iv = isn->bounds.fields[i].intervals;
-                // Step 1: reverse the list.
-                std::reverse(iv.begin(), iv.end());
-                // Step 2: reverse each interval.
-                for (size_t j = 0; j < iv.size(); ++j) {
-                    iv[j].reverse();
-                }
+                isn->bounds.fields[i].reverse();
             }
         }
 
-        if (!isn->bounds.isValidFor(isn->indexKeyPattern, isn->direction)) {
-            severe() << "Invalid bounds: " << isn->bounds.toString();
+        if (!isn->bounds.isValidFor(isn->index.keyPattern, isn->direction)) {
+            severe() << "Invalid bounds: " << redact(isn->bounds.toString());
             MONGO_UNREACHABLE;
         }
 

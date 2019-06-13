@@ -6,17 +6,11 @@
 
     var mongos = st.s;
     var staleMongos = st.s1;
-    var config = mongos.getDB("config");
     var admin = mongos.getDB("admin");
-    var shards = config.shards.find().toArray();
-
-    for (var i = 0; i < shards.length; i++) {
-        shards[i].conn = new Mongo(shards[i].host);
-    }
 
     var collSh = mongos.getCollection(jsTestName() + ".collSharded");
     var collUn = mongos.getCollection(jsTestName() + ".collUnsharded");
-    var collDi = shards[0].conn.getCollection(jsTestName() + ".collDirect");
+    var collDi = st.shard0.getCollection(jsTestName() + ".collDirect");
 
     jsTest.log('Checking write to config collections...');
     assert.writeOK(admin.TestColl.insert({SingleDoc: 1}));
@@ -25,9 +19,10 @@
     jsTest.log("Setting up collections...");
 
     assert.commandWorked(admin.runCommand({enableSharding: collSh.getDB() + ""}));
-    st.ensurePrimaryShard(collSh.getDB() + "", shards[0]._id);
+    st.ensurePrimaryShard(collSh.getDB() + "", st.shard0.shardName);
 
-    assert.commandWorked(admin.runCommand({movePrimary: collUn.getDB() + "", to: shards[1]._id}));
+    assert.commandWorked(
+        admin.runCommand({movePrimary: collUn.getDB() + "", to: st.shard1.shardName}));
 
     printjson(collSh.ensureIndex({ukey: 1}, {unique: true}));
     printjson(collUn.ensureIndex({ukey: 1}, {unique: true}));
@@ -36,7 +31,7 @@
     assert.commandWorked(admin.runCommand({shardCollection: collSh + "", key: {ukey: 1}}));
     assert.commandWorked(admin.runCommand({split: collSh + "", middle: {ukey: 0}}));
     assert.commandWorked(admin.runCommand(
-        {moveChunk: collSh + "", find: {ukey: 0}, to: shards[0]._id, _waitForDelete: true}));
+        {moveChunk: collSh + "", find: {ukey: 0}, to: st.shard0.shardName, _waitForDelete: true}));
 
     var resetColls = function() {
         assert.writeOK(collSh.remove({}));
@@ -240,17 +235,17 @@
     //
 
     jsTest.log("Testing bulk insert (no COE) with WBL...");
-
     resetColls();
+
     var inserts = [{ukey: 1}, {ukey: -1}];
 
     var staleCollSh = staleMongos.getCollection(collSh + "");
+    assert.eq(null, staleCollSh.findOne(), 'Collections should be empty');
 
-    staleCollSh.findOne();
     assert.commandWorked(admin.runCommand(
-        {moveChunk: collSh + "", find: {ukey: 0}, to: shards[1]._id, _waitForDelete: true}));
+        {moveChunk: collSh + "", find: {ukey: 0}, to: st.shard1.shardName, _waitForDelete: true}));
     assert.commandWorked(admin.runCommand(
-        {moveChunk: collSh + "", find: {ukey: 0}, to: shards[0]._id, _waitForDelete: true}));
+        {moveChunk: collSh + "", find: {ukey: 0}, to: st.shard0.shardName, _waitForDelete: true}));
 
     assert.writeOK(staleCollSh.insert(inserts));
 
@@ -260,16 +255,9 @@
     //
 
     jsTest.log("Testing bulk insert (no COE) with WBL and large objects...");
-
-    var data1MB = "x";
-    while (data1MB.length < 1024 * 1024)
-        data1MB += data1MB;
-
-    var data10MB = "";
-    for (var i = 0; i < 10; i++)
-        data10MB += data1MB;
-
     resetColls();
+
+    var data10MB = 'x'.repeat(10 * 1024 * 1024);
     var inserts = [
         {ukey: 1, data: data10MB},
         {ukey: 2, data: data10MB},
@@ -278,12 +266,12 @@
     ];
 
     staleCollSh = staleMongos.getCollection(collSh + "");
+    assert.eq(null, staleCollSh.findOne(), 'Collections should be empty');
 
-    staleCollSh.findOne();
     assert.commandWorked(admin.runCommand(
-        {moveChunk: collSh + "", find: {ukey: 0}, to: shards[1]._id, _waitForDelete: true}));
+        {moveChunk: collSh + "", find: {ukey: 0}, to: st.shard1.shardName, _waitForDelete: true}));
     assert.commandWorked(admin.runCommand(
-        {moveChunk: collSh + "", find: {ukey: 0}, to: shards[0]._id, _waitForDelete: true}));
+        {moveChunk: collSh + "", find: {ukey: 0}, to: st.shard0.shardName, _waitForDelete: true}));
 
     assert.writeOK(staleCollSh.insert(inserts));
 

@@ -8,6 +8,7 @@
     var baseName = "shard_insert_getlasterror_w2";
     var testDBName = baseName;
     var testCollName = 'coll';
+    var replNodes = 3;
 
     // ~1KB string
     var textString = '';
@@ -20,7 +21,7 @@
         name: baseName,
         mongos: 1,
         shards: 1,
-        rs: {nodes: 3},
+        rs: {nodes: replNodes},
         other: {manualAddShard: true}
     };
     var shardingTest = new ShardingTest(shardingTestConfig);
@@ -34,14 +35,14 @@
     for (var i = 0; i < numDocs; i++) {
         bulk.insert({x: i, text: textString});
     }
-    assert.writeOK(bulk.execute({w: 2}));
+    assert.writeOK(bulk.execute());
 
     // Get connection to mongos for the cluster
     var mongosConn = shardingTest.s;
     var testDB = mongosConn.getDB(testDBName);
 
     // Add replSet1 as only shard
-    mongosConn.adminCommand({addshard: replSet1.getURL()});
+    assert.commandWorked(mongosConn.adminCommand({addshard: replSet1.getURL()}));
 
     // Enable sharding on test db and its collection foo
     assert.commandWorked(mongosConn.getDB('admin').runCommand({enablesharding: testDBName}));
@@ -50,7 +51,7 @@
         {shardcollection: testDBName + '.' + testCollName, key: {x: 1}}));
 
     // Test case where GLE should return an error
-    testDB.foo.insert({_id: 'a', x: 1});
+    assert.writeOK(testDB.foo.insert({_id: 'a', x: 1}));
     assert.writeError(testDB.foo.insert({_id: 'a', x: 1}, {writeConcern: {w: 2, wtimeout: 30000}}));
 
     // Add more data
@@ -58,7 +59,7 @@
     for (var i = numDocs; i < 2 * numDocs; i++) {
         bulk.insert({x: i, text: textString});
     }
-    assert.writeOK(bulk.execute({w: 2, wtimeout: 30000}));
+    assert.writeOK(bulk.execute({w: replNodes, wtimeout: 30000}));
 
     // Take down two nodes and make sure slaveOk reads still work
     replSet1.stop(1);

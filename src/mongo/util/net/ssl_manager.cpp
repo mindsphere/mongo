@@ -34,9 +34,10 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/thread/recursive_mutex.hpp>
-#include <boost/thread/tss.hpp>
+#include <boost/thread/thread.hpp>
 #include <iostream>
 #include <sstream>
+#include <stack>
 #include <string>
 #include <vector>
 
@@ -47,17 +48,23 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/mutex.h"
+#include "mongo/util/concurrency/threadlocal.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/message.h"
 #include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_expiration.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/text.h"
 
 #ifdef MONGO_CONFIG_SSL
+#include <openssl/asn1.h>
+#include <openssl/asn1t.h>
 #include <openssl/evp.h>
 #include <openssl/x509_vfy.h>
 #include <openssl/x509v3.h>
@@ -67,8 +74,6 @@
 #include <Security/Security.h>
 #endif
 #endif
-
-using std::endl;
 
 namespace mongo {
 
@@ -87,6 +92,11 @@ ExportedServerParameter<bool, ServerParameterType::kStartupOnly>
     disableNonSSLConnectionLoggingParameter(ServerParameterSet::getGlobal(),
                                             "disableNonSSLConnectionLogging",
                                             &sslGlobalParams.disableNonSSLConnectionLogging);
+
+ExportedServerParameter<bool, ServerParameterType::kStartupOnly>
+    suppressNoTLSPeerCertificateWarning(ServerParameterSet::getGlobal(),
+                                        "suppressNoTLSPeerCertificateWarning",
+                                        &sslGlobalParams.suppressNoTLSPeerCertificateWarning);
 
 class OpenSSLCipherConfigParameter
     : public ExportedServerParameter<std::string, ServerParameterType::kStartupOnly> {
@@ -126,33 +136,77 @@ public:
 
 namespace {
 
+// clang-format off
+#ifndef MONGO_CONFIG_HAVE_ASN1_ANY_DEFINITIONS
+// Copies of OpenSSL before 1.0.0 do not have ASN1_SEQUENCE_ANY, ASN1_SET_ANY, or the helper
+// functions which let us deserialize these objects. We must polyfill the definitions to interact
+// with ASN1 objects so stored.
+typedef STACK_OF(ASN1_TYPE) ASN1_SEQUENCE_ANY;
+
+ASN1_ITEM_TEMPLATE(ASN1_SEQUENCE_ANY) =
+    ASN1_EX_TEMPLATE_TYPE(ASN1_TFLG_SEQUENCE_OF, 0, ASN1_SEQUENCE_ANY, ASN1_ANY)
+ASN1_ITEM_TEMPLATE_END(ASN1_SEQUENCE_ANY)
+
+ASN1_ITEM_TEMPLATE(ASN1_SET_ANY) =
+    ASN1_EX_TEMPLATE_TYPE(ASN1_TFLG_SET_OF, 0, ASN1_SET_ANY, ASN1_ANY)
+ASN1_ITEM_TEMPLATE_END(ASN1_SET_ANY)
+
+IMPLEMENT_ASN1_ENCODE_FUNCTIONS_const_fname(ASN1_SEQUENCE_ANY, ASN1_SEQUENCE_ANY,
+                                            ASN1_SEQUENCE_ANY)
+IMPLEMENT_ASN1_ENCODE_FUNCTIONS_const_fname(ASN1_SEQUENCE_ANY, ASN1_SET_ANY, ASN1_SET_ANY)
+; // clang format needs to see a semicolon or it will start formatting unrelated code
+#endif // MONGO_CONFIG_NEEDS_ASN1_ANY_DEFINITIONS
+// clang-format on
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+// Copies of OpenSSL after 1.1.0 define new functions for interaction with
+// X509 structure. We must polyfill used definitions to interact with older
+// OpenSSL versions.
+const STACK_OF(X509_EXTENSION) * X509_get0_extensions(const X509* peerCert) {
+    return peerCert->cert_info->extensions;
+}
+inline int X509_NAME_ENTRY_set(const X509_NAME_ENTRY* ne) {
+    return ne->set;
+}
+#endif
+
 /**
  * Multithreaded Support for SSL.
  *
  * In order to allow OpenSSL to work in a multithreaded environment, you
- * must provide some callbacks for it to use for locking.  The following code
- * sets up a vector of mutexes and uses thread-local storage to assign an id
- * to each thread.
+ * may need to provide some callbacks for it to use for locking. The following code
+ * sets up a vector of mutexes and provides a thread unique ID number.
  * The so-called SSLThreadInfo class encapsulates most of the logic required for
  * OpenSSL multithreaded support.
+ *
+ * OpenSSL before version 1.1.0 requires applications provide a callback which emits a thread
+ * identifier. This ID is used to store thread specific ERR information. When a thread is
+ * terminated, it must call ERR_remove_state or ERR_remove_thread_state. These functions may
+ * themselves invoke the application provided callback. These IDs are stored in a hashtable with
+ * a questionable hash function. They must be uniformly distributed to prevent collisions.
  */
-
-unsigned long _ssl_id_callback();
-void _ssl_locking_callback(int mode, int type, const char* file, int line);
-
 class SSLThreadInfo {
 public:
-    SSLThreadInfo() {
-        _id = _next.fetchAndAdd(1);
+    static unsigned long getID() {
+        struct ThreadLocalState {
+            bool firstCall;
+            unsigned long id;
+        };
+        static MONGO_TRIVIALLY_CONSTRUCTIBLE_THREAD_LOCAL ThreadLocalState state{true, 0};
+        if (state.firstCall) {
+            state.id = _idManager.reserveID();
+            unsigned long id = state.id;
+            boost::this_thread::at_thread_exit([id] {
+                ERR_remove_state(0);
+                _idManager.releaseID(id);
+            });
+            state.firstCall = false;
+        }
+
+        return state.id;
     }
 
-    ~SSLThreadInfo() {}
-
-    unsigned long id() const {
-        return _id;
-    }
-
-    void lock_callback(int mode, int type, const char* file, int line) {
+    static void lockingCallback(int mode, int type, const char* file, int line) {
         if (mode & CRYPTO_LOCK) {
             _mutex[type]->lock();
         } else {
@@ -161,38 +215,50 @@ public:
     }
 
     static void init() {
+        CRYPTO_set_id_callback(&SSLThreadInfo::getID);
+        CRYPTO_set_locking_callback(&SSLThreadInfo::lockingCallback);
+
         while ((int)_mutex.size() < CRYPTO_num_locks()) {
             _mutex.emplace_back(stdx::make_unique<stdx::recursive_mutex>());
         }
     }
 
-    static SSLThreadInfo* get() {
-        SSLThreadInfo* me = _thread.get();
-        if (!me) {
-            me = new SSLThreadInfo();
-            _thread.reset(me);
-        }
-        return me;
-    }
-
 private:
-    unsigned _id;
+    SSLThreadInfo() = delete;
 
-    static AtomicUInt32 _next;
     // Note: see SERVER-8734 for why we are using a recursive mutex here.
     // Once the deadlock fix in OpenSSL is incorporated into most distros of
     // Linux, this can be changed back to a nonrecursive mutex.
     static std::vector<std::unique_ptr<stdx::recursive_mutex>> _mutex;
-    static boost::thread_specific_ptr<SSLThreadInfo> _thread;
+
+    class ThreadIDManager {
+    public:
+        unsigned long reserveID() {
+            stdx::unique_lock<stdx::mutex> lock(_idMutex);
+            if (!_idLast.empty()) {
+                unsigned long ret = _idLast.top();
+                _idLast.pop();
+                return ret;
+            }
+            return ++_idNext;
+        }
+
+        void releaseID(unsigned long id) {
+            stdx::unique_lock<stdx::mutex> lock(_idMutex);
+            _idLast.push(id);
+        }
+
+    private:
+        // Machinery for producing IDs that are unique for the life of a thread.
+        stdx::mutex _idMutex;       // Protects _idNext and _idLast.
+        unsigned long _idNext = 0;  // Stores the next thread ID to use, if none already allocated.
+        std::stack<unsigned long, std::vector<unsigned long>>
+            _idLast;  // Stores old thread IDs, for reuse.
+    };
+    static ThreadIDManager _idManager;
 };
-
-unsigned long _ssl_id_callback() {
-    return SSLThreadInfo::get()->id();
-}
-
-void _ssl_locking_callback(int mode, int type, const char* file, int line) {
-    SSLThreadInfo::get()->lock_callback(mode, type, file, line);
-}
+std::vector<std::unique_ptr<stdx::recursive_mutex>> SSLThreadInfo::_mutex;
+SSLThreadInfo::ThreadIDManager SSLThreadInfo::_idManager;
 
 // We only want to free SSL_CTX objects if they have been populated. OpenSSL seems to perform this
 // check before freeing them, but because it does not document this, we should protect ourselves.
@@ -201,10 +267,6 @@ void _free_ssl_context(SSL_CTX* ctx) {
         SSL_CTX_free(ctx);
     }
 }
-
-AtomicUInt32 SSLThreadInfo::_next;
-std::vector<std::unique_ptr<stdx::recursive_mutex>> SSLThreadInfo::_mutex;
-boost::thread_specific_ptr<SSLThreadInfo> SSLThreadInfo::_thread;
 
 ////////////////////////////////////////////////////////////////
 
@@ -230,13 +292,11 @@ public:
 
     virtual SSLConnection* accept(Socket* socket, const char* initialBytes, int len);
 
-    virtual std::string parseAndValidatePeerCertificateDeprecated(const SSLConnection* conn,
+    virtual SSLPeerInfo parseAndValidatePeerCertificateDeprecated(const SSLConnection* conn,
                                                                   const std::string& remoteHost);
 
-    StatusWith<boost::optional<std::string>> parseAndValidatePeerCertificate(
+    StatusWith<boost::optional<SSLPeerInfo>> parseAndValidatePeerCertificate(
         SSL* conn, const std::string& remoteHost) final;
-
-    virtual void cleanupThreadLocals();
 
     virtual const SSLConfiguration& getSSLConfiguration() const {
         return _sslConfiguration;
@@ -257,12 +317,15 @@ public:
     virtual void SSL_free(SSLConnection* conn);
 
 private:
+    const int _rolesNid = OBJ_create(mongodbRolesOID.identifier.c_str(),
+                                     mongodbRolesOID.shortDescription.c_str(),
+                                     mongodbRolesOID.longDescription.c_str());
     UniqueSSLContext _serverContext;  // SSL context for incoming connections
     UniqueSSLContext _clientContext;  // SSL context for outgoing connections
-    std::string _password;
     bool _weakValidation;
     bool _allowInvalidCertificates;
     bool _allowInvalidHostnames;
+    bool _suppressNoCertificateWarning;
     SSLConfiguration _sslConfiguration;
 
     /**
@@ -275,7 +338,7 @@ private:
      * Given an error code from an SSL-type IO function, logs an
      * appropriate message and throws a SocketException
      */
-    MONGO_COMPILER_NORETURN void _handleSSLError(int code, int ret);
+    MONGO_COMPILER_NORETURN void _handleSSLError(SSLConnection* conn, int ret);
 
     /*
      * Init the SSL context using parameters provided in params. This SSL context will
@@ -302,8 +365,12 @@ private:
      * @return bool showing if the function was successful.
      */
     bool _parseAndValidateCertificate(const std::string& keyFile,
-                                      std::string* subjectName,
+                                      const std::string& keyPassword,
+                                      SSLX509Name* subjectName,
                                       Date_t* serverNotAfter);
+
+
+    StatusWith<stdx::unordered_set<RoleName>> _parsePeerRoles(X509* peerCert) const;
 
     /** @return true if was successful, otherwise false */
     bool _setupPEM(SSL_CTX* context, const std::string& keyFile, const std::string& password);
@@ -352,20 +419,26 @@ void setupFIPS() {
     int status = FIPS_mode_set(1);
     if (!status) {
         severe() << "can't activate FIPS mode: "
-                 << SSLManagerInterface::getSSLErrorMessage(ERR_get_error()) << endl;
+                 << SSLManagerInterface::getSSLErrorMessage(ERR_get_error());
         fassertFailedNoTrace(16703);
     }
-    log() << "FIPS 140-2 mode activated" << endl;
+    log() << "FIPS 140-2 mode activated";
 #else
     severe() << "this version of mongodb was not compiled with FIPS support";
     fassertFailedNoTrace(17089);
 #endif
 }
+
+TLSVersionCounts tlsVersionCounts;
+
 }  // namespace
+
+TLSVersionCounts& TLSVersionCounts::get() {
+    return tlsVersionCounts;
+}
 
 // Global variable indicating if this is a server or a client instance
 bool isSSLServer = false;
-
 
 MONGO_INITIALIZER(SetupOpenSSL)(InitializerContext*) {
     SSL_library_init();
@@ -380,19 +453,15 @@ MONGO_INITIALIZER(SetupOpenSSL)(InitializerContext*) {
     // so that encryption/decryption is backwards compatible
     OpenSSL_add_all_algorithms();
 
-    // Setup OpenSSL multithreading callbacks
-    CRYPTO_set_id_callback(_ssl_id_callback);
-    CRYPTO_set_locking_callback(_ssl_locking_callback);
-
+    // Setup OpenSSL multithreading callbacks and mutexes
     SSLThreadInfo::init();
-    SSLThreadInfo::get();
 
     return Status::OK();
 }
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("SetupOpenSSL"))(InitializerContext*) {
     stdx::lock_guard<SimpleMutex> lck(sslManagerMtx);
-    if (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled) {
+    if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
         theSSLManager = new SSLManager(sslGlobalParams, isSSLServer);
     }
     return Status::OK();
@@ -410,31 +479,46 @@ SSLManagerInterface* getSSLManager() {
     return NULL;
 }
 
-std::string getCertificateSubjectName(X509* cert) {
-    std::string result;
+SSLX509Name getCertificateSubjectX509Name(X509* cert) {
+    std::vector<std::vector<SSLX509Name::Entry>> entries;
 
-    BIO* out = BIO_new(BIO_s_mem());
-    uassert(16884, "unable to allocate BIO memory", NULL != out);
-    ON_BLOCK_EXIT(BIO_free, out);
+    auto name = X509_get_subject_name(cert);
+    int count = X509_NAME_entry_count(name);
+    int prevSet = -1;
+    std::vector<SSLX509Name::Entry> rdn;
+    for (int i = count - 1; i >= 0; --i) {
+        auto* entry = X509_NAME_get_entry(name, i);
 
-    if (X509_NAME_print_ex(out, X509_get_subject_name(cert), 0, XN_FLAG_RFC2253) >= 0) {
-        if (BIO_number_written(out) > 0) {
-            result.resize(BIO_number_written(out));
-            BIO_read(out, &result[0], result.size());
+        const auto currentSet = X509_NAME_ENTRY_set(entry);
+        if (currentSet != prevSet) {
+            if (!rdn.empty()) {
+                entries.push_back(std::move(rdn));
+                rdn = std::vector<SSLX509Name::Entry>();
+            }
+            prevSet = currentSet;
         }
-    } else {
-        log() << "failed to convert subject name to RFC2253 format" << endl;
+
+        char buffer[128];
+        // OBJ_obj2txt can only fail if we pass a nullptr from get_object,
+        // or if OpenSSL's BN library falls over.
+        // In either case, just panic.
+        uassert(ErrorCodes::InvalidSSLConfiguration,
+                "Unable to parse certiciate subject name",
+                OBJ_obj2txt(buffer, sizeof(buffer), X509_NAME_ENTRY_get_object(entry), 1) > 0);
+
+        const auto* str = X509_NAME_ENTRY_get_data(entry);
+        rdn.emplace_back(
+            buffer, str->type, std::string(reinterpret_cast<const char*>(str->data), str->length));
+    }
+    if (!rdn.empty()) {
+        entries.push_back(std::move(rdn));
     }
 
-    return result;
+    return SSLX509Name(std::move(entries));
 }
 
 SSLConnection::SSLConnection(SSL_CTX* context, Socket* sock, const char* initialBytes, int len)
     : socket(sock) {
-    // This just ensures that SSL multithreading support is set up for this thread,
-    // if it's not already.
-    SSLThreadInfo::get();
-
     ssl = SSL_new(context);
 
     std::string sslErr =
@@ -463,6 +547,96 @@ SSLConnection::~SSLConnection() {
 }
 
 namespace {
+std::string x509OidToShortName(const std::string& name) {
+    const auto nid = OBJ_txt2nid(name.c_str());
+    if (nid == 0) {
+        return name;
+    }
+    const auto* sn = OBJ_nid2sn(nid);
+    if (!sn) {
+        return name;
+    }
+    return sn;
+}
+
+// Characters that need to be escaped in RFC 2253
+const std::array<char, 7> rfc2253EscapeChars = {',', '+', '"', '\\', '<', '>', ';'};
+
+// See section "2.4 Converting an AttributeValue from ASN.1 to a String" in RFC 2243
+std::string escapeRfc2253(StringData str) {
+    std::string ret;
+
+    if (str.size() > 0) {
+        size_t pos = 0;
+
+        // a space or "#" character occurring at the beginning of the string
+        if (str[0] == ' ') {
+            ret = "\\ ";
+            pos = 1;
+        } else if (str[0] == '#') {
+            ret = "\\#";
+            pos = 1;
+        }
+
+        while (pos < str.size()) {
+            if (static_cast<signed char>(str[pos]) < 0) {
+                ret += '\\';
+                ret += integerToHex(str[pos]);
+            } else {
+                if (std::find(rfc2253EscapeChars.cbegin(), rfc2253EscapeChars.cend(), str[pos]) !=
+                    rfc2253EscapeChars.cend()) {
+                    ret += '\\';
+                }
+
+                ret += str[pos];
+            }
+            ++pos;
+        }
+
+        // a space character occurring at the end of the string
+        if (ret.size() > 2 && ret[ret.size() - 1] == ' ') {
+            ret[ret.size() - 1] = '\\';
+            ret += ' ';
+        }
+    }
+
+    return ret;
+}
+
+}  // namespace
+
+StatusWith<std::string> SSLX509Name::getOID(StringData oid) const {
+    for (const auto& rdn : _entries) {
+        for (const auto& entry : rdn) {
+            if (entry.oid == oid) {
+                return entry.value;
+            }
+        }
+    }
+    return {ErrorCodes::KeyNotFound, "OID does not exist"};
+}
+
+StringBuilder& operator<<(StringBuilder& os, const SSLX509Name& name) {
+    std::string comma;
+    for (const auto& rdn : name._entries) {
+        std::string plus;
+        os << comma;
+        for (const auto& entry : rdn) {
+            os << plus << x509OidToShortName(entry.oid) << "=" << escapeRfc2253(entry.value);
+            plus = "+";
+        }
+        comma = ",";
+    }
+    return os;
+}
+
+std::string SSLX509Name::toString() const {
+    StringBuilder os;
+    os << *this;
+    return os.str();
+}
+
+namespace {
 void canonicalizeClusterDN(std::vector<std::string>* dn) {
     // remove all RDNs we don't care about
     for (size_t i = 0; i < dn->size(); i++) {
@@ -477,30 +651,62 @@ void canonicalizeClusterDN(std::vector<std::string>* dn) {
     }
     std::stable_sort(dn->begin(), dn->end());
 }
+
+constexpr StringData kOID_DC = "0.9.2342.19200300.100.1.25"_sd;
+constexpr StringData kOID_O = "2.5.4.10"_sd;
+constexpr StringData kOID_OU = "2.5.4.11"_sd;
+
+std::vector<SSLX509Name::Entry> canonicalizeClusterDN(
+    const std::vector<std::vector<SSLX509Name::Entry>>& entries) {
+    std::vector<SSLX509Name::Entry> ret;
+
+    for (const auto& rdn : entries) {
+        for (const auto& entry : rdn) {
+            if ((entry.oid != kOID_DC) && (entry.oid != kOID_O) && (entry.oid != kOID_OU)) {
+                continue;
+            }
+            ret.push_back(entry);
+        }
+    }
+    std::stable_sort(ret.begin(), ret.end());
+    return ret;
+}
+}  // namespace
+
+/**
+ * The behavior of isClusterMember() is subtly different when passed
+ * an SSLX509Name versus a StringData.
+ *
+ * The SSLX509Name version (immediately below) compares distinguished
+ * names in their raw, unescaped forms and provides a more reliable match.
+ *
+ * The StringData version attempts to do a simplified string compare
+ * with the serialized version of the server subject name.
+ *
+ * Because escaping is not checked in the StringData version,
+ * some not-strictly matching RDNs will appear to share O/OU/DC with the
+ * server subject name.  Therefore, that variant should be called with care.
+ */
+bool SSLConfiguration::isClusterMember(const SSLX509Name& subject) const {
+    auto client = canonicalizeClusterDN(subject._entries);
+    auto server = canonicalizeClusterDN(serverSubjectName._entries);
+
+    return !client.empty() && (client == server);
 }
 
 bool SSLConfiguration::isClusterMember(StringData subjectName) const {
     std::vector<std::string> clientRDN = StringSplitter::split(subjectName.toString(), ",");
-    std::vector<std::string> serverRDN = StringSplitter::split(serverSubjectName, ",");
+    std::vector<std::string> serverRDN = StringSplitter::split(serverSubjectName.toString(), ",");
 
     canonicalizeClusterDN(&clientRDN);
     canonicalizeClusterDN(&serverRDN);
 
-    if (clientRDN.size() == 0 || clientRDN.size() != serverRDN.size()) {
-        return false;
-    }
-
-    for (size_t i = 0; i < serverRDN.size(); i++) {
-        if (clientRDN[i] != serverRDN[i]) {
-            return false;
-        }
-    }
-    return true;
+    return !clientRDN.empty() && (clientRDN == serverRDN);
 }
 
 BSONObj SSLConfiguration::getServerStatusBSON() const {
     BSONObjBuilder security;
-    security.append("SSLServerSubjectName", serverSubjectName);
+    security.append("SSLServerSubjectName", serverSubjectName.toString());
     security.appendBool("SSLServerHasCertificateAuthority", hasCA);
     security.appendDate("SSLServerCertificateExpirationDate", serverCertificateExpirationDate);
     return security.obj();
@@ -513,24 +719,28 @@ SSLManager::SSLManager(const SSLParams& params, bool isServer)
       _clientContext(nullptr, _free_ssl_context),
       _weakValidation(params.sslWeakCertificateValidation),
       _allowInvalidCertificates(params.sslAllowInvalidCertificates),
-      _allowInvalidHostnames(params.sslAllowInvalidHostnames) {
+      _allowInvalidHostnames(params.sslAllowInvalidHostnames),
+      _suppressNoCertificateWarning(params.suppressNoTLSPeerCertificateWarning) {
     if (!_initSynchronousSSLContext(&_clientContext, params, ConnectionDirection::kOutgoing)) {
         uasserted(16768, "ssl initialization problem");
     }
 
     // pick the certificate for use in outgoing connections,
-    std::string clientPEM;
+    std::string clientPEM, clientPassword;
     if (!isServer || params.sslClusterFile.empty()) {
         // We are either a client, or a server without a cluster key,
         // so use the PEM key file, if specified
         clientPEM = params.sslPEMKeyFile;
+        clientPassword = params.sslPEMKeyPassword;
     } else {
         // We are a server with a cluster key, so use the cluster key file
         clientPEM = params.sslClusterFile;
+        clientPassword = params.sslClusterPassword;
     }
 
     if (!clientPEM.empty()) {
-        if (!_parseAndValidateCertificate(clientPEM, &_sslConfiguration.clientSubjectName, NULL)) {
+        if (!_parseAndValidateCertificate(
+                clientPEM, clientPassword, &_sslConfiguration.clientSubjectName, NULL)) {
             uasserted(16941, "ssl initialization problem");
         }
     }
@@ -541,6 +751,7 @@ SSLManager::SSLManager(const SSLParams& params, bool isServer)
         }
 
         if (!_parseAndValidateCertificate(params.sslPEMKeyFile,
+                                          params.sslPEMKeyPassword,
                                           &_sslConfiguration.serverSubjectName,
                                           &_sslConfiguration.serverCertificateExpirationDate)) {
             uasserted(16942, "ssl initialization problem");
@@ -554,8 +765,10 @@ SSLManager::SSLManager(const SSLParams& params, bool isServer)
 int SSLManager::password_cb(char* buf, int num, int rwflag, void* userdata) {
     // Unless OpenSSL misbehaves, num should always be positive
     fassert(17314, num > 0);
-    SSLManager* sm = static_cast<SSLManager*>(userdata);
-    const size_t copied = sm->_password.copy(buf, num - 1);
+    invariant(userdata);
+    auto pw = static_cast<const std::string*>(userdata);
+
+    const size_t copied = pw->copy(buf, num - 1);
     buf[copied] = '\0';
     return copied;
 }
@@ -571,7 +784,7 @@ int SSLManager::SSL_read(SSLConnection* conn, void* buf, int num) {
     } while (!_doneWithSSLOp(conn, status));
 
     if (status <= 0)
-        _handleSSLError(SSL_get_error(conn, status), status);
+        _handleSSLError(conn, status);
     return status;
 }
 
@@ -582,7 +795,7 @@ int SSLManager::SSL_write(SSLConnection* conn, const void* buf, int num) {
     } while (!_doneWithSSLOp(conn, status));
 
     if (status <= 0)
-        _handleSSLError(SSL_get_error(conn, status), status);
+        _handleSSLError(conn, status);
     return status;
 }
 
@@ -605,7 +818,7 @@ int SSLManager::SSL_shutdown(SSLConnection* conn) {
     } while (!_doneWithSSLOp(conn, status));
 
     if (status < 0)
-        _handleSSLError(SSL_get_error(conn, status), status);
+        _handleSSLError(conn, status);
     return status;
 }
 
@@ -616,10 +829,6 @@ void SSLManager::SSL_free(SSLConnection* conn) {
 Status SSLManager::initSSLContext(SSL_CTX* context,
                                   const SSLParams& params,
                                   ConnectionDirection direction) {
-    if (direction == ConnectionDirection::kIncoming) {
-        fassert(34364, context == _serverContext.get());
-    }
-
     // SSL_OP_ALL - Activate all bug workaround options, to support buggy client SSL's.
     // SSL_OP_NO_SSLv2 - Disable SSL v2 support
     // SSL_OP_NO_SSLv3 - Disable SSL v3 support
@@ -743,7 +952,8 @@ unsigned long long SSLManager::_convertASN1ToMillis(ASN1_TIME* asn1time) {
 }
 
 bool SSLManager::_parseAndValidateCertificate(const std::string& keyFile,
-                                              std::string* subjectName,
+                                              const std::string& keyPassword,
+                                              SSLX509Name* subjectName,
                                               Date_t* serverCertificateExpirationDate) {
     BIO* inBIO = BIO_new(BIO_s_file());
     if (inBIO == NULL) {
@@ -758,7 +968,11 @@ bool SSLManager::_parseAndValidateCertificate(const std::string& keyFile,
         return false;
     }
 
-    X509* x509 = PEM_read_bio_X509(inBIO, NULL, &SSLManager::password_cb, this);
+    // Callback will not manipulate the password, so const_cast is safe.
+    X509* x509 = PEM_read_bio_X509(inBIO,
+                                   NULL,
+                                   &SSLManager::password_cb,
+                                   const_cast<void*>(static_cast<const void*>(&keyPassword)));
     if (x509 == NULL) {
         error() << "cannot retrieve certificate from keyfile: " << keyFile << ' '
                 << getSSLErrorMessage(ERR_get_error());
@@ -766,7 +980,7 @@ bool SSLManager::_parseAndValidateCertificate(const std::string& keyFile,
     }
     ON_BLOCK_EXIT(X509_free, x509);
 
-    *subjectName = getCertificateSubjectName(x509);
+    *subjectName = getCertificateSubjectX509Name(x509);
     if (serverCertificateExpirationDate != NULL) {
         unsigned long long notBeforeMillis = _convertASN1ToMillis(X509_get_notBefore(x509));
         if (notBeforeMillis == 0) {
@@ -794,30 +1008,51 @@ bool SSLManager::_parseAndValidateCertificate(const std::string& keyFile,
 bool SSLManager::_setupPEM(SSL_CTX* context,
                            const std::string& keyFile,
                            const std::string& password) {
-    _password = password;
-
     if (SSL_CTX_use_certificate_chain_file(context, keyFile.c_str()) != 1) {
         error() << "cannot read certificate file: " << keyFile << ' '
-                << getSSLErrorMessage(ERR_get_error()) << endl;
+                << getSSLErrorMessage(ERR_get_error());
+        return false;
+    }
+
+    BIO* inBio = BIO_new(BIO_s_file());
+    if (!inBio) {
+        error() << "failed to allocate BIO object: " << getSSLErrorMessage(ERR_get_error());
+        return false;
+    }
+    const auto bioGuard = MakeGuard([&inBio]() { BIO_free(inBio); });
+
+    if (BIO_read_filename(inBio, keyFile.c_str()) <= 0) {
+        error() << "cannot read PEM key file: " << keyFile << ' '
+                << getSSLErrorMessage(ERR_get_error());
         return false;
     }
 
     // If password is empty, use default OpenSSL callback, which uses the terminal
     // to securely request the password interactively from the user.
+    decltype(&SSLManager::password_cb) password_cb = nullptr;
+    void* userdata = nullptr;
     if (!password.empty()) {
-        SSL_CTX_set_default_passwd_cb_userdata(context, this);
-        SSL_CTX_set_default_passwd_cb(context, &SSLManager::password_cb);
+        password_cb = &SSLManager::password_cb;
+        // SSLManager::password_cb will not manipulate the password, so const_cast is safe.
+        userdata = const_cast<void*>(static_cast<const void*>(&password));
     }
-
-    if (SSL_CTX_use_PrivateKey_file(context, keyFile.c_str(), SSL_FILETYPE_PEM) != 1) {
+    EVP_PKEY* privateKey = PEM_read_bio_PrivateKey(inBio, nullptr, password_cb, userdata);
+    if (!privateKey) {
         error() << "cannot read PEM key file: " << keyFile << ' '
-                << getSSLErrorMessage(ERR_get_error()) << endl;
+                << getSSLErrorMessage(ERR_get_error());
+        return false;
+    }
+    const auto privateKeyGuard = MakeGuard([&privateKey]() { EVP_PKEY_free(privateKey); });
+
+    if (SSL_CTX_use_PrivateKey(context, privateKey) != 1) {
+        error() << "cannot use PEM key file: " << keyFile << ' '
+                << getSSLErrorMessage(ERR_get_error());
         return false;
     }
 
     // Verify that the certificate and the key go together.
     if (SSL_CTX_check_private_key(context) != 1) {
-        error() << "SSL certificate validation: " << getSSLErrorMessage(ERR_get_error()) << endl;
+        error() << "SSL certificate validation: " << getSSLErrorMessage(ERR_get_error());
         return false;
     }
 
@@ -890,9 +1125,9 @@ Status importCertStoreToX509_STORE(LPWSTR storeName, DWORD storeLocation, X509_S
     }
     int lastError = GetLastError();
     if (lastError != CRYPT_E_NOT_FOUND) {
-        return {
-            ErrorCodes::InvalidSSLConfiguration,
-            str::stream() << "Error enumerating certificates: " << errnoWithDescription(lastError)};
+        return {ErrorCodes::InvalidSSLConfiguration,
+                str::stream() << "Error enumerating certificates: "
+                              << errnoWithDescription(lastError)};
     }
 
     return Status::OK();
@@ -941,9 +1176,9 @@ Status importKeychainToX509_STORE(X509_STORE* verifyStore) {
 
         auto rawData = makeCFTypeRefHolder(SecCertificateCopyData(cert));
         if (!rawData) {
-            return {
-                ErrorCodes::InvalidSSLConfiguration,
-                str::stream() << "Error enumerating certificates: " << OSStatusToString(status)};
+            return {ErrorCodes::InvalidSSLConfiguration,
+                    str::stream() << "Error enumerating certificates: "
+                                  << OSStatusToString(status)};
         }
         const uint8_t* rawDataPtr = CFDataGetBytePtr(rawData);
 
@@ -973,11 +1208,14 @@ Status SSLManager::_setupSystemCA(SSL_CTX* context) {
     // On non-Windows/non-Apple platforms, the OpenSSL libraries should have been configured
     // with default locations for CA certificates.
     if (SSL_CTX_set_default_verify_paths(context) != 1) {
-        return {
-            ErrorCodes::InvalidSSLConfiguration,
-            str::stream() << "error loading system CA certificates "
-                          << "(default certificate file: " << X509_get_default_cert_file() << ", "
-                          << "default certificate path: " << X509_get_default_cert_dir() << ")"};
+        return {ErrorCodes::InvalidSSLConfiguration,
+                str::stream() << "error loading system CA certificates "
+                              << "(default certificate file: "
+                              << X509_get_default_cert_file()
+                              << ", "
+                              << "default certificate path: "
+                              << X509_get_default_cert_dir()
+                              << ")"};
     }
     return Status::OK();
 #else
@@ -1008,12 +1246,12 @@ bool SSLManager::_setupCRL(SSL_CTX* context, const std::string& crlFile) {
 
     int status = X509_load_crl_file(lookup, crlFile.c_str(), X509_FILETYPE_PEM);
     if (status == 0) {
-        error() << "cannot read CRL file: " << crlFile << ' ' << getSSLErrorMessage(ERR_get_error())
-                << endl;
+        error() << "cannot read CRL file: " << crlFile << ' '
+                << getSSLErrorMessage(ERR_get_error());
         return false;
     }
     log() << "ssl imported " << status << " revoked certificate" << ((status == 1) ? "" : "s")
-          << " from the revocation list." << endl;
+          << " from the revocation list.";
     return true;
 }
 
@@ -1085,13 +1323,16 @@ SSLConnection* SSLManager::connect(Socket* socket) {
     std::unique_ptr<SSLConnection> sslConn =
         stdx::make_unique<SSLConnection>(_clientContext.get(), socket, (const char*)NULL, 0);
 
-    int ret;
+    int ret = ::SSL_set_tlsext_host_name(sslConn->ssl, socket->remoteAddr().hostOrIp().c_str());
+    if (ret != 1)
+        _handleSSLError(sslConn.get(), ret);
+
     do {
         ret = ::SSL_connect(sslConn->ssl);
     } while (!_doneWithSSLOp(sslConn.get(), ret));
 
     if (ret != 1)
-        _handleSSLError(SSL_get_error(sslConn.get(), ret), ret);
+        _handleSSLError(sslConn.get(), ret);
 
     return sslConn.release();
 }
@@ -1106,7 +1347,7 @@ SSLConnection* SSLManager::accept(Socket* socket, const char* initialBytes, int 
     } while (!_doneWithSSLOp(sslConn.get(), ret));
 
     if (ret != 1)
-        _handleSSLError(SSL_get_error(sslConn.get(), ret), ret);
+        _handleSSLError(sslConn.get(), ret);
 
     return sslConn.release();
 }
@@ -1127,8 +1368,36 @@ bool SSLManager::_hostNameMatch(const char* nameToMatch, const char* certHostNam
     }
 }
 
-StatusWith<boost::optional<std::string>> SSLManager::parseAndValidatePeerCertificate(
+void recordTLSVersion(const SSL* conn) {
+    int protocol = SSL_version(conn);
+
+    auto& counts = mongo::TLSVersionCounts::get();
+    switch (protocol) {
+        case TLS1_VERSION:
+            counts.tls10.addAndFetch(1);
+            break;
+        case TLS1_1_VERSION:
+            counts.tls11.addAndFetch(1);
+            break;
+        case TLS1_2_VERSION:
+            counts.tls12.addAndFetch(1);
+            break;
+#ifdef TLS1_3_VERSION
+        case TLS1_3_VERSION:
+            counts.tls13.addAndFetch(1);
+            break;
+#endif
+        default:
+            // Do nothing
+            break;
+    }
+}
+
+StatusWith<boost::optional<SSLPeerInfo>> SSLManager::parseAndValidatePeerCertificate(
     SSL* conn, const std::string& remoteHost) {
+
+    recordTLSVersion(conn);
+
     if (!_sslConfiguration.hasCA && isSSLServer)
         return {boost::none};
 
@@ -1136,7 +1405,11 @@ StatusWith<boost::optional<std::string>> SSLManager::parseAndValidatePeerCertifi
 
     if (NULL == peerCert) {  // no certificate presented by peer
         if (_weakValidation) {
-            warning() << "no SSL certificate provided by peer" << endl;
+            // do not give warning if certificate warnings are suppressed
+            if (!_suppressNoCertificateWarning) {
+                warning() << "no SSL certificate provided by peer";
+            }
+            return {boost::none};
         } else {
             auto msg = "no SSL certificate provided by peer; connection rejected";
             error() << msg;
@@ -1163,12 +1436,19 @@ StatusWith<boost::optional<std::string>> SSLManager::parseAndValidatePeerCertifi
     }
 
     // TODO: check optional cipher restriction, using cert.
-    std::string peerSubjectName = getCertificateSubjectName(peerCert);
+    auto peerSubject = getCertificateSubjectX509Name(peerCert);
+    LOG(2) << "Accepted TLS connection from peer: " << peerSubject;
+
+    StatusWith<stdx::unordered_set<RoleName>> swPeerCertificateRoles = _parsePeerRoles(peerCert);
+    if (!swPeerCertificateRoles.isOK()) {
+        return swPeerCertificateRoles.getStatus();
+    }
 
     // If this is an SSL client context (on a MongoDB server or client)
     // perform hostname validation of the remote server
     if (remoteHost.empty()) {
-        return boost::make_optional(peerSubjectName);
+        return boost::make_optional(
+            SSLPeerInfo(peerSubject, std::move(swPeerCertificateRoles.getValue())));
     }
 
     // Try to match using the Subject Alternate Name, if it exists.
@@ -1178,12 +1458,14 @@ StatusWith<boost::optional<std::string>> SSLManager::parseAndValidatePeerCertifi
 
     bool sanMatch = false;
     bool cnMatch = false;
+    StringBuilder certificateNames;
 
     STACK_OF(GENERAL_NAME)* sanNames = static_cast<STACK_OF(GENERAL_NAME)*>(
         X509_get_ext_d2i(peerCert, NID_subject_alt_name, NULL, NULL));
 
     if (sanNames != NULL) {
         int sanNamesList = sk_GENERAL_NAME_num(sanNames);
+        certificateNames << "SAN(s): ";
         for (int i = 0; i < sanNamesList; i++) {
             const GENERAL_NAME* currentName = sk_GENERAL_NAME_value(sanNames, i);
             if (currentName && currentName->type == GEN_DNS) {
@@ -1192,35 +1474,43 @@ StatusWith<boost::optional<std::string>> SSLManager::parseAndValidatePeerCertifi
                     sanMatch = true;
                     break;
                 }
+                certificateNames << std::string(dnsName) << " ";
             }
         }
         sk_GENERAL_NAME_pop_free(sanNames, GENERAL_NAME_free);
     } else {
-        // If Subject Alternate Name (SAN) didn't exist, check Common Name (CN).
-        int cnBegin = peerSubjectName.find("CN=") + 3;
-        int cnEnd = peerSubjectName.find(",", cnBegin);
-        std::string commonName = peerSubjectName.substr(cnBegin, cnEnd - cnBegin);
-
-        if (_hostNameMatch(remoteHost.c_str(), commonName.c_str())) {
-            cnMatch = true;
+        // If Subject Alternate Name (SAN) doesn't exist and Common Name (CN) does,
+        // check Common Name.
+        auto swCN = peerSubject.getOID(kOID_CommonName);
+        if (swCN.isOK()) {
+            auto commonName = std::move(swCN.getValue());
+            if (_hostNameMatch(remoteHost.c_str(), commonName.c_str())) {
+                cnMatch = true;
+            }
+            certificateNames << "CN: " << commonName;
+        } else {
+            certificateNames << "No Common Name (CN) or Subject Alternate Names (SAN) found";
         }
     }
 
     if (!sanMatch && !cnMatch) {
+        StringBuilder msgBuilder;
+        msgBuilder << "The server certificate does not match the host name. Hostname: "
+                   << remoteHost << " does not match " << certificateNames.str();
+        std::string msg = msgBuilder.str();
         if (_allowInvalidCertificates || _allowInvalidHostnames) {
-            warning() << "The server certificate does not match the host name " << remoteHost;
+            warning() << msg;
         } else {
-            str::stream msg;
-            msg << "The server certificate does not match the host name " << remoteHost;
-            error() << msg.ss.str();
+            error() << msg;
             return Status(ErrorCodes::SSLHandshakeFailed, msg);
         }
     }
 
-    return boost::make_optional(peerSubjectName);
+    return boost::make_optional(SSLPeerInfo(peerSubject, stdx::unordered_set<RoleName>()));
 }
 
-std::string SSLManager::parseAndValidatePeerCertificateDeprecated(const SSLConnection* conn,
+
+SSLPeerInfo SSLManager::parseAndValidatePeerCertificateDeprecated(const SSLConnection* conn,
                                                                   const std::string& remoteHost) {
     auto swPeerSubjectName = parseAndValidatePeerCertificate(conn->ssl, remoteHost);
     // We can't use uassertStatusOK here because we need to throw a SocketException.
@@ -1228,11 +1518,128 @@ std::string SSLManager::parseAndValidatePeerCertificateDeprecated(const SSLConne
         throw SocketException(SocketException::CONNECT_ERROR,
                               swPeerSubjectName.getStatus().reason());
     }
-    return swPeerSubjectName.getValue().get_value_or("");
+    return swPeerSubjectName.getValue().get_value_or(SSLPeerInfo());
 }
 
-void SSLManager::cleanupThreadLocals() {
-    ERR_remove_state(0);
+StatusWith<stdx::unordered_set<RoleName>> SSLManager::_parsePeerRoles(X509* peerCert) const {
+    // exts is owned by the peerCert
+    const STACK_OF(X509_EXTENSION)* exts = X509_get0_extensions(peerCert);
+
+    int extCount = 0;
+    if (exts) {
+        extCount = sk_X509_EXTENSION_num(exts);
+    }
+
+    ASN1_OBJECT* rolesObj = OBJ_nid2obj(_rolesNid);
+
+    // Search all certificate extensions for our own
+    stdx::unordered_set<RoleName> roles;
+    for (int i = 0; i < extCount; i++) {
+        X509_EXTENSION* ex = sk_X509_EXTENSION_value(exts, i);
+        ASN1_OBJECT* obj = X509_EXTENSION_get_object(ex);
+
+        if (!OBJ_cmp(obj, rolesObj)) {
+            // We've found an extension which has our roles OID
+            ASN1_OCTET_STRING* data = X509_EXTENSION_get_data(ex);
+
+            /*
+             * MongoDBAuthorizationGrant ::= CHOICE {
+             *  MongoDBRole,
+             *  ...!UTF8String:"Unrecognized entity in MongoDBAuthorizationGrant"
+             * }
+             * MongoDBAuthorizationGrants ::= SET OF MongoDBAuthorizationGrant
+             */
+            // Extract the set of roles from our extension, and load them into an OpenSSL stack.
+            STACK_OF(ASN1_TYPE)* mongoDBAuthorizationGrants = nullptr;
+
+            // OpenSSL's parsing function will try and manipulate the pointer it's passed. If we
+            // passed it 'data->data' directly, it would modify structures owned by peerCert.
+            const unsigned char* dataBytes = data->data;
+            mongoDBAuthorizationGrants =
+                d2i_ASN1_SET_ANY(&mongoDBAuthorizationGrants, &dataBytes, data->length);
+            if (!mongoDBAuthorizationGrants) {
+                return Status(ErrorCodes::FailedToParse,
+                              "Failed to parse x509 authorization grants");
+            }
+            const auto grantGuard = MakeGuard([&mongoDBAuthorizationGrants]() {
+                sk_ASN1_TYPE_pop_free(mongoDBAuthorizationGrants, ASN1_TYPE_free);
+            });
+
+            /*
+             * MongoDBRole ::= SEQUENCE {
+             *  role     UTF8String,
+             *  database UTF8String
+             * }
+             */
+            // Loop through every role in the stack.
+            ASN1_TYPE* MongoDBRoleWrapped = nullptr;
+            while ((MongoDBRoleWrapped = sk_ASN1_TYPE_pop(mongoDBAuthorizationGrants))) {
+                const auto roleWrappedGuard =
+                    MakeGuard([MongoDBRoleWrapped]() { ASN1_TYPE_free(MongoDBRoleWrapped); });
+
+                if (MongoDBRoleWrapped->type == V_ASN1_SEQUENCE) {
+                    // Unwrap the ASN1Type into a STACK_OF(ASN1_TYPE)
+                    unsigned char* roleBytes = ASN1_STRING_data(MongoDBRoleWrapped->value.sequence);
+                    int roleBytesLength = ASN1_STRING_length(MongoDBRoleWrapped->value.sequence);
+                    ASN1_SEQUENCE_ANY* MongoDBRole = nullptr;
+                    MongoDBRole = d2i_ASN1_SEQUENCE_ANY(
+                        &MongoDBRole, (const unsigned char**)&roleBytes, roleBytesLength);
+                    if (!MongoDBRole) {
+                        return Status(ErrorCodes::FailedToParse,
+                                      "Failed to parse role in x509 authorization grant");
+                    }
+                    const auto roleGuard = MakeGuard(
+                        [&MongoDBRole]() { sk_ASN1_TYPE_pop_free(MongoDBRole, ASN1_TYPE_free); });
+
+                    if (sk_ASN1_TYPE_num(MongoDBRole) != 2) {
+                        return Status(ErrorCodes::FailedToParse,
+                                      "Role entity in MongoDBAuthorizationGrant must have exactly "
+                                      "2 sequence elements");
+                    }
+                    // Extract the subcomponents of the sequence, which are popped off the stack in
+                    // reverse order. Here, parse the role's database.
+                    ASN1_TYPE* roleComponent = sk_ASN1_TYPE_pop(MongoDBRole);
+                    const auto roleDBGuard =
+                        MakeGuard([roleComponent]() { ASN1_TYPE_free(roleComponent); });
+                    if (roleComponent->type != V_ASN1_UTF8STRING) {
+                        return Status(ErrorCodes::FailedToParse,
+                                      "database in MongoDBRole must be a UTF8 string");
+                    }
+                    std::string roleDB(
+                        reinterpret_cast<char*>(ASN1_STRING_data(roleComponent->value.utf8string)));
+
+                    // Parse the role's name.
+                    roleComponent = sk_ASN1_TYPE_pop(MongoDBRole);
+                    const auto roleNameGuard =
+                        MakeGuard([roleComponent]() { ASN1_TYPE_free(roleComponent); });
+                    if (roleComponent->type != V_ASN1_UTF8STRING) {
+                        return Status(ErrorCodes::FailedToParse,
+                                      "role in MongoDBRole must be a UTF8 string");
+                    }
+                    std::string roleName(
+                        reinterpret_cast<char*>(ASN1_STRING_data(roleComponent->value.utf8string)));
+
+                    // Construct a RoleName from the subcomponents
+                    roles.emplace(RoleName(roleName, roleDB));
+
+                } else {
+                    return Status(ErrorCodes::FailedToParse,
+                                  "Unrecognized entity in MongoDBAuthorizationGrant");
+                }
+            }
+            LOG(1) << "MONGODB-X509 authorization parsed the following roles from peer "
+                      "certificate: "
+                   << [&roles]() {
+                          StringBuilder sb;
+                          std::for_each(roles.begin(), roles.end(), [&sb](const RoleName& role) {
+                              sb << role.toString();
+                          });
+                          return sb.str();
+                      }();
+        }
+    }
+
+    return roles;
 }
 
 std::string SSLManagerInterface::getSSLErrorMessage(int code) {
@@ -1244,7 +1651,8 @@ std::string SSLManagerInterface::getSSLErrorMessage(int code) {
     return msg;
 }
 
-void SSLManager::_handleSSLError(int code, int ret) {
+void SSLManager::_handleSSLError(SSLConnection* conn, int ret) {
+    int code = SSL_get_error(conn, ret);
     int err = ERR_get_error();
 
     switch (code) {
@@ -1281,8 +1689,148 @@ void SSLManager::_handleSSLError(int code, int ret) {
             error() << "unrecognized SSL error";
             break;
     }
+    _flushNetworkBIO(conn);
     throw SocketException(SocketException::CONNECT_ERROR, "");
 }
+
+boost::optional<std::array<std::uint8_t, 7>> checkTLSRequest(ConstDataRange dataRange) {
+    // This method's caller should have read in at least one MSGHEADER::Value's worth of data.
+    // The fragment we are about to examine must be strictly smaller.
+    static const size_t sizeOfTLSFragmentToRead = 11;
+    invariant(dataRange.length() >= sizeOfTLSFragmentToRead);
+
+    static_assert(sizeOfTLSFragmentToRead < sizeof(MSGHEADER::Value),
+                  "checkTLSRequest's caller read a MSGHEADER::Value, which must be larger than "
+                  "message containing the TLS version");
+
+    ConstDataRangeCursor cdr(dataRange);
+
+    /**
+     * The fragment we are to examine is a record, containing a handshake, containing a
+     * ClientHello. We wish to examine the advertised protocol version in the ClientHello.
+     * The following roughly describes the contents of these structures. Note that we do not
+     * need, or wish to, examine the entire ClientHello, we're looking exclusively for the
+     * client_version.
+     *
+     * Below is a rough description of the payload we will be examining. We shall perform some
+     * basic checks to ensure the payload matches these expectations. If it does not, we should
+     * bail out, and not emit protocol version alerts.
+     *
+     * enum {alert(21), handshake(22)} ContentType;
+     * TLSPlaintext {
+     *   ContentType type = handshake(22),
+     *   ProtocolVersion version; // Irrelevant. Clients send the real version in ClientHello.
+     *   uint16 length;
+     *   fragment, see Handshake stuct for contents
+     * ...
+     * }
+     *
+     * enum {client_hello(1)} HandshakeType;
+     * Handshake {
+     *   HandshakeType msg_type = client_hello(1);
+     *   uint24_t length;
+     *   ClientHello body;
+     * }
+     *
+     * ClientHello {
+     *   ProtocolVersion client_version; // <- This is the value we want to extract.
+     * }
+     */
+
+    static const std::uint8_t ContentType_handshake = 22;
+    static const std::uint8_t HandshakeType_client_hello = 1;
+
+    using ProtocolVersion = std::array<std::uint8_t, 2>;
+    static const ProtocolVersion tls10VersionBytes{3, 1};
+    static const ProtocolVersion tls11VersionBytes{3, 2};
+
+    // Parse the record header.
+    // Extract the ContentType from the header, and ensure it is a handshake.
+    StatusWith<std::uint8_t> record_ContentType = cdr.readAndAdvance<std::uint8_t>();
+    if (!record_ContentType.isOK() || record_ContentType.getValue() != ContentType_handshake) {
+        return boost::none;
+    }
+    // Skip the record's ProtocolVersion. Clients tend to send TLS 1.0 in
+    // the record, but then their real protocol version in the enclosed ClientHello.
+    StatusWith<ProtocolVersion> record_protocol_version = cdr.readAndAdvance<ProtocolVersion>();
+    if (!record_protocol_version.isOK()) {
+        return boost::none;
+    }
+    // Parse the record length. It should be be larger than the remaining expected payload.
+    auto record_length = cdr.readAndAdvance<BigEndian<std::uint16_t>>();
+    if (!record_length.isOK() || record_length.getValue() < cdr.length()) {
+        return boost::none;
+    }
+
+    // Parse the handshake header.
+    // Extract the HandshakeType, and ensure it is a ClientHello.
+    StatusWith<std::uint8_t> handshake_type = cdr.readAndAdvance<std::uint8_t>();
+    if (!handshake_type.isOK() || handshake_type.getValue() != HandshakeType_client_hello) {
+        return boost::none;
+    }
+    // Extract the handshake length, and ensure it is larger than the remaining expected
+    // payload. This requires a little work because the packet represents it with a uint24_t.
+    StatusWith<std::array<std::uint8_t, 3>> handshake_length_bytes =
+        cdr.readAndAdvance<std::array<std::uint8_t, 3>>();
+    if (!handshake_length_bytes.isOK()) {
+        return boost::none;
+    }
+    std::uint32_t handshake_length = 0;
+    for (std::uint8_t handshake_byte : handshake_length_bytes.getValue()) {
+        handshake_length <<= 8;
+        handshake_length |= handshake_byte;
+    }
+    if (handshake_length < cdr.length()) {
+        return boost::none;
+    }
+    StatusWith<ProtocolVersion> client_version = cdr.readAndAdvance<ProtocolVersion>();
+    if (!client_version.isOK()) {
+        return boost::none;
+    }
+
+    // Invariant: We read exactly as much data as expected.
+    invariant(cdr.data() - dataRange.data() == sizeOfTLSFragmentToRead);
+
+    auto isProtocolDisabled = [](SSLParams::Protocols protocol) {
+        const auto& params = getSSLGlobalParams();
+        return std::find(params.sslDisabledProtocols.begin(),
+                         params.sslDisabledProtocols.end(),
+                         protocol) != params.sslDisabledProtocols.end();
+    };
+
+    auto makeTLSProtocolVersionAlert =
+        [](const std::array<std::uint8_t, 2>& versionBytes) -> std::array<std::uint8_t, 7> {
+        /**
+         * The structure for this alert packet is as follows:
+         * TLSPlaintext {
+         *   ContentType type = alert(21);
+         *   ProtocolVersion = versionBytes;
+         *   uint16_t length = 2
+         *   fragment = AlertDescription {
+         *     AlertLevel level = fatal(2);
+         *     AlertDescription = protocol_version(70);
+         *   }
+         *
+         */
+        return std::array<std::uint8_t, 7>{
+            0x15, versionBytes[0], versionBytes[1], 0x00, 0x02, 0x02, 0x46};
+    };
+
+    ProtocolVersion version = client_version.getValue();
+    if (version == tls10VersionBytes && isProtocolDisabled(SSLParams::Protocols::TLS1_0)) {
+        return makeTLSProtocolVersionAlert(version);
+    } else if (client_version == tls11VersionBytes &&
+               isProtocolDisabled(SSLParams::Protocols::TLS1_1)) {
+        return makeTLSProtocolVersionAlert(version);
+    }
+    // TLS1.2 cannot be distinguished from TLS1.3, just by looking at the ProtocolVersion bytes.
+    // TLS 1.3 compatible clients advertise a "supported_versions" extension, which we would
+    // have to extract here.
+    // Hopefully by the time this matters, OpenSSL will properly emit protocol_version alerts.
+
+    return boost::none;
+}
+
 #else
 
 MONGO_INITIALIZER(SSLManager)(InitializerContext*) {

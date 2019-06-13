@@ -166,10 +166,7 @@
         };
         var collName = getCollName(testCollDetailsNum);
 
-        var cmdObj = {
-            shardCollection: collName,
-            key: {_id: 1}
-        };
+        var cmdObj = {shardCollection: collName, key: {_id: 1}};
         if (args.unique) {
             cmdObj.unique = true;
         }
@@ -187,6 +184,7 @@
         var output = grabStatusOutput(st.config);
 
         assertPresentInOutput(output, collName, "collection");
+
         // If any of the previous collection names are present, then their optional indicators
         // might also be present.  This might taint the results when we go searching through
         // the output.
@@ -196,6 +194,7 @@
         }
 
         assertPresentInOutput(output, "unique: " + (!!args.unique), "unique shard key indicator");
+
         if (args.hasOwnProperty("unique") && typeof(args.unique) != "boolean") {
             // non-bool: actual value must be shown
             assertPresentInOutput(
@@ -210,7 +209,12 @@
             assertPresentInOutput(output, tojson(args.noBalance), "noBalance indicator (non bool)");
         }
 
-        assert(mongos.getCollection(collName).drop());
+        try {
+            mongos.getCollection(collName).drop();
+        } catch (e) {
+            // Ignore drop errors because they are from the illegal values in the collection entry
+            assert.writeOK(mongos.getDB("config").collections.remove({_id: collName}));
+        }
 
         testCollDetailsNum++;
     }

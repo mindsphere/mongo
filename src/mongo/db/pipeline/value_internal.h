@@ -32,13 +32,14 @@
 #include <boost/config.hpp>
 #include <boost/intrusive_ptr.hpp>
 
+#include "mongo/base/static_assert.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsontypes.h"
-#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/intrusive_counter.h"
-#include "mongo/bson/timestamp.h"
 
 
 namespace mongo {
@@ -75,7 +76,6 @@ public:
     const Decimal128 decimalValue;
 };
 
-#pragma pack(1)
 class ValueStorage {
 public:
     // Note: it is important the memory is zeroed out (by calling zero()) at the start of every
@@ -197,11 +197,6 @@ public:
     }
 
     ValueStorage& operator=(ValueStorage&& rhs) BOOST_NOEXCEPT {
-#if defined(_MSC_VER) && _MSC_VER < 1900  // MSVC 2013 STL can emit self-move-assign.
-        if (&rhs == this)
-            return *this;
-#endif
-
         DEV verifyRefCountingIfShould();
         if (refCounter)
             intrusive_ptr_release(genericRCPtr);
@@ -315,6 +310,7 @@ public:
 
     // This data is public because this should only be used by Value which would be a friend
     union {
+#pragma pack(1)
         struct {
             // byte 1
             signed char type;
@@ -358,11 +354,16 @@ public:
                 };
             };
         };
+#pragma pack()
 
         // covers the whole ValueStorage
         long long i64[2];
+
+        // Forces the ValueStorage type to have at least pointer alignment. Can't use alignas on the
+        // type since that causes issues on MSVC.
+        void* forcePointerAlignment;
     };
 };
-static_assert(sizeof(ValueStorage) == 16, "sizeof(ValueStorage) == 16");
-#pragma pack()
+MONGO_STATIC_ASSERT(sizeof(ValueStorage) == 16);
+MONGO_STATIC_ASSERT(alignof(ValueStorage) >= alignof(void*));
 }

@@ -4,12 +4,16 @@ Interface of the different fixtures for executing JSTests against.
 
 from __future__ import absolute_import
 
+import os.path
 import time
 
 import pymongo
+import pymongo.errors
 
+from ... import config
 from ... import errors
 from ... import logging
+from ... import utils
 
 
 class Fixture(object):
@@ -17,9 +21,9 @@ class Fixture(object):
     Base class for all fixtures.
     """
 
-    def __init__(self, logger, job_num):
+    def __init__(self, logger, job_num, dbpath_prefix=None):
         """
-        Initializes the fixtures with a logger instance.
+        Initializes the fixture with a logger instance.
         """
 
         if not isinstance(logger, logging.Logger):
@@ -32,8 +36,11 @@ class Fixture(object):
 
         self.logger = logger
         self.job_num = job_num
-
         self.port = None  # Port that the mongo shell should connect to.
+
+        dbpath_prefix = utils.default_if_none(config.DBPATH_PREFIX, dbpath_prefix)
+        dbpath_prefix = utils.default_if_none(dbpath_prefix, config.DEFAULT_DBPATH_PREFIX)
+        self._dbpath_prefix = os.path.join(dbpath_prefix, "job{}".format(self.job_num))
 
     def setup(self):
         """
@@ -47,9 +54,28 @@ class Fixture(object):
         """
         pass
 
-    def teardown(self):
+    def teardown(self, finished=False):
         """
-        Destroys the fixture. Return true if was successful, and false otherwise.
+        Destroys the fixture. Return true if was successful, and false
+        otherwise.
+
+        The fixture's logging handlers are closed if 'finished' is true,
+        which should happen when setup() won't be called again.
+        """
+
+        try:
+            return self._do_teardown()
+        finally:
+            if finished:
+                for handler in self.logger.handlers:
+                    # We ignore the cancellation token returned by close_later() since we always
+                    # want the logs to eventually get flushed.
+                    logging.flush.close_later(handler)
+
+    def _do_teardown(self):
+        """
+        Destroys the fixture. Return true if was successful, and false
+        otherwise.
         """
         return True
 
@@ -59,6 +85,9 @@ class Fixture(object):
         can be run, and false otherwise.
         """
         return True
+
+    def get_dbpath_prefix(self):
+        return self._dbpath_prefix
 
     def get_internal_connection_string(self):
         """
@@ -128,3 +157,16 @@ class ReplFixture(Fixture):
                 if remaining <= 0.0:
                     raise errors.ServerFailure("Failed to connect to the primary on port %d" %
                                                self.port)
+
+class NoOpFixture(Fixture):
+    """A Fixture implementation that does not start any servers.
+
+    Used when the MongoDB deployment is started by the JavaScript test itself with MongoRunner,
+    ReplSetTest, or ShardingTest.
+    """
+
+    def get_internal_connection_string(self):
+        return None
+
+    def get_driver_connection_url(self):
+        return None

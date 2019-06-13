@@ -1,8 +1,4 @@
-/**
- * SERVER-2451 Kill cursor while explain is yielding
- *
- * @tags: [requires_parallel_shell]
- */
+/** SERVER-2451 Kill cursor while explain is yielding */
 
 t = db.jstests_explain3;
 t.drop();

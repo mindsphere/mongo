@@ -113,15 +113,17 @@ public:
         return static_cast<bool>(_ptr);
     }
 
-    const SecureHandle<SCRAMSecretsHolder>& operator*() const {
+    const SecureHandle<SCRAMSecretsHolder>& operator*() const& {
         invariant(_ptr);
         return *_ptr;
     }
+    void operator*() && = delete;
 
-    const SecureHandle<SCRAMSecretsHolder>& operator->() const {
+    const SecureHandle<SCRAMSecretsHolder>& operator->() const& {
         invariant(_ptr);
         return *_ptr;
     }
+    void operator->() && = delete;
 
 private:
     std::shared_ptr<SecureHandle<SCRAMSecretsHolder>> _ptr;

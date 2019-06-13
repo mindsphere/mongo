@@ -9,6 +9,7 @@ import sys
 
 from .. import config
 from .. import errors
+from .. import logging
 from ..utils import queue as _queue
 
 
@@ -17,7 +18,7 @@ class Job(object):
     Runs tests from a queue.
     """
 
-    def __init__(self, logger, fixture, hooks, report):
+    def __init__(self, logger, fixture, hooks, report, archival):
         """
         Initializes the job with the specified fixture and custom
         behaviors.
@@ -27,11 +28,17 @@ class Job(object):
         self.fixture = fixture
         self.hooks = hooks
         self.report = report
+        self.archival = archival
 
-    def __call__(self, queue, interrupt_flag):
+    def __call__(self, queue, interrupt_flag, teardown_flag=None):
         """
         Continuously executes tests from 'queue' and records their
         details in 'report'.
+
+        If 'teardown_flag' is not None, then 'self.fixture.teardown()'
+        will be called before this method returns. If an error occurs
+        while destroying the fixture, then the 'teardown_flag' will be
+        set.
         """
 
         should_stop = False
@@ -51,6 +58,15 @@ class Job(object):
             interrupt_flag.set()
             # Drain the queue to unblock the main thread.
             Job._drain_queue(queue)
+
+        if teardown_flag is not None:
+            try:
+                if not self.fixture.teardown(finished=True):
+                    self.logger.warn("Teardown of %s was not successful.", self.fixture)
+                    teardown_flag.set()
+            except:
+                self.logger.exception("Encountered an error while tearing down %s.", self.fixture)
+                teardown_flag.set()
 
     def _run(self, queue, interrupt_flag):
         """
@@ -79,23 +95,40 @@ class Job(object):
         Calls the before/after test hooks and executes 'test'.
         """
 
-        test.configure(self.fixture)
+        test.configure(self.fixture, config.NUM_CLIENTS_PER_FIXTURE)
         self._run_hooks_before_tests(test)
 
         test(self.report)
-        if config.FAIL_FAST and not self.report.wasSuccessful():
-            test.logger.info("%s failed, so stopping..." % (test.shortDescription()))
-            raise errors.StopExecution("%s failed" % (test.shortDescription()))
+        try:
+            if config.FAIL_FAST and not self.report.wasSuccessful():
+                self.logger.info("%s failed, so stopping..." % (test.shortDescription()))
+                raise errors.StopExecution("%s failed" % (test.shortDescription()))
 
-        if not self.fixture.is_running():
-            self.logger.error("%s marked as a failure because the fixture crashed during the test.",
-                              test.shortDescription())
-            self.report.setFailure(test, return_code=2)
-            # Always fail fast if the fixture fails.
-            raise errors.StopExecution("%s not running after %s" %
-                                       (self.fixture, test.shortDescription()))
+            if not self.fixture.is_running():
+                self.logger.error(
+                    "%s marked as a failure because the fixture crashed during the test.",
+                    test.shortDescription())
+                self.report.setFailure(test, return_code=2)
+                # Always fail fast if the fixture fails.
+                raise errors.StopExecution("%s not running after %s" %
+                                           (self.fixture, test.shortDescription()))
+
+        finally:
+            success = self.report.find_test_info(test).status == "pass"
+            if self.archival:
+                self.archival.archive(self.logger, test, success)
 
         self._run_hooks_after_tests(test)
+
+    def _run_hook(self, hook, hook_function, test):
+        """Provide helper to run hook and archival."""
+        try:
+            success = False
+            hook_function(test, self.report)
+            success = True
+        finally:
+            if self.archival:
+                self.archival.archive(self.logger, test, success, hook=hook)
 
     def _run_hooks_before_tests(self, test):
         """
@@ -107,7 +140,7 @@ class Job(object):
 
         try:
             for hook in self.hooks:
-                hook.before_test(test, self.report)
+                self._run_hook(hook, hook.before_test, test)
 
         except errors.StopExecution:
             raise
@@ -141,7 +174,7 @@ class Job(object):
         """
         try:
             for hook in self.hooks:
-                hook.after_test(test, self.report)
+                self._run_hook(hook, hook.after_test, test)
 
         except errors.StopExecution:
             raise

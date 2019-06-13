@@ -147,7 +147,7 @@ class TestReport(unittest.TestResult):
         unittest.TestResult.stopTest(self, test)
 
         with self._lock:
-            test_info = self._find_test_info(test)
+            test_info = self.find_test_info(test)
             test_info.end_time = time.time()
 
         time_taken = test_info.end_time - test_info.start_time
@@ -155,7 +155,10 @@ class TestReport(unittest.TestResult):
 
         # Asynchronously closes the buildlogger test handler to avoid having too many threads open
         # on 32-bit systems.
-        logging.flush.close_later(test.logger)
+        for handler in test.logger.handlers:
+            # We ignore the cancellation token returned by close_later() since we always want the
+            # logs to eventually get flushed.
+            logging.flush.close_later(handler)
 
         # Restore the original logger for the test.
         #
@@ -174,7 +177,7 @@ class TestReport(unittest.TestResult):
         with self._lock:
             self.num_errored += 1
 
-            test_info = self._find_test_info(test)
+            test_info = self.find_test_info(test)
             test_info.status = "error"
             test_info.return_code = test.return_code
 
@@ -184,7 +187,7 @@ class TestReport(unittest.TestResult):
         """
 
         with self._lock:
-            test_info = self._find_test_info(test)
+            test_info = self.find_test_info(test)
             if test_info.end_time is None:
                 raise ValueError("stopTest was not called on %s" % (test.basename()))
 
@@ -208,7 +211,7 @@ class TestReport(unittest.TestResult):
         with self._lock:
             self.num_failed += 1
 
-            test_info = self._find_test_info(test)
+            test_info = self.find_test_info(test)
             test_info.status = "fail"
             test_info.return_code = test.return_code
 
@@ -218,7 +221,7 @@ class TestReport(unittest.TestResult):
         """
 
         with self._lock:
-            test_info = self._find_test_info(test)
+            test_info = self.find_test_info(test)
             if test_info.end_time is None:
                 raise ValueError("stopTest was not called on %s" % (test.basename()))
 
@@ -241,7 +244,7 @@ class TestReport(unittest.TestResult):
         with self._lock:
             self.num_succeeded += 1
 
-            test_info = self._find_test_info(test)
+            test_info = self.find_test_info(test)
             test_info.status = "pass"
             test_info.return_code = test.return_code
 
@@ -349,7 +352,7 @@ class TestReport(unittest.TestResult):
         # protecting it with the lock.
         self.__original_loggers = {}
 
-    def _find_test_info(self, test):
+    def find_test_info(self, test):
         """
         Returns the status and timing information associated with
         'test'.

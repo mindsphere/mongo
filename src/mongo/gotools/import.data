@@ -1,0 +1,6 @@
+{
+    "commit": "a486a2aad18c47a9bc6c16e65672690888210832", 
+    "github": "mongodb/mongo-tools.git", 
+    "vendor": "tools", 
+    "branch": "v3.4"
+}

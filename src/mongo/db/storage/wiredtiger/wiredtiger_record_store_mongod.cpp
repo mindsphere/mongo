@@ -40,7 +40,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
@@ -77,7 +76,8 @@ public:
             return false;
         }
 
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
 
         try {
             ScopedTransaction transaction(&txn, MODE_IX);
@@ -136,9 +136,9 @@ bool WiredTigerKVEngine::initRsOplogBackgroundThread(StringData ns) {
         return false;
     }
 
-    if (storageGlobalParams.repair) {
+    if (storageGlobalParams.repair || storageGlobalParams.readOnly) {
         LOG(1) << "not starting WiredTigerRecordStoreThread for " << ns
-               << " because we are in repair";
+               << " because we are either in repair or read-only mode";
         return false;
     }
 
